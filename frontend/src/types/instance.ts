@@ -150,6 +150,7 @@ export interface InstanceRuntimeDetails {
   agent?: AgentInfo;
   commands: InstanceRuntimeCommand[];
   skills?: InstanceSkill[];
+  llm_governance?: InstanceLLMGovernanceStatus;
 }
 
 export interface InstanceConfigRevision {
@@ -316,6 +317,13 @@ export const INSTANCE_TYPES: InstanceType[] = [
     defaultVersion: "latest",
   },
 ];
+
+export interface InstanceLLMGovernanceStatus {
+  config_status: string;
+  session_fallback_rate: number;
+  recent_egress_block_count: number;
+  is_compliant: boolean;
+}
 
 export const PRESET_CONFIGS = {
   small: {

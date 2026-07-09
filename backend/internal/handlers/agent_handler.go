@@ -225,7 +225,7 @@ func (h *AgentHandler) UploadSkillPackage(c *gin.Context) {
 	}
 	item, err := h.skillService.UploadAgentSkillPackage(c.Request.Context(), session.Instance.ID, req, fileHeader)
 	if err != nil {
-		utils.HandleError(c, err)
+		utils.HandleHubError(c, err)
 		return
 	}
 	utils.Success(c, http.StatusCreated, "Agent skill package uploaded successfully", item)

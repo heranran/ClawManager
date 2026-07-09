@@ -6,6 +6,7 @@ import type {
   UpdateInstanceRequest,
   InstanceStatus,
   InstanceRuntimeDetails,
+  InstanceRuntimeCommand,
   InstanceConfigRevision,
   ExternalAccessStatusResult,
   EnableShareLinkResult,
@@ -229,6 +230,11 @@ export const instanceService = {
 
   listSkills: async (id: number): Promise<InstanceSkill[]> => {
     const response = await api.get(`/instances/${id}/skills`);
+    return response.data.data;
+  },
+
+  syncInstanceSkills: async (id: number): Promise<InstanceRuntimeCommand> => {
+    const response = await api.post(`/instances/${id}/skills/sync`);
     return response.data.data;
   },
 };

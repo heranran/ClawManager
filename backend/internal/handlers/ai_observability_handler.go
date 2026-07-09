@@ -90,3 +90,14 @@ func (h *AIObservabilityHandler) GetCostOverview(c *gin.Context) {
 
 	utils.Success(c, http.StatusOK, "AI cost overview retrieved successfully", overview)
 }
+
+// GetLLMGovernanceOverview returns managed-runtime LLM governance summary for admins.
+func (h *AIObservabilityHandler) GetLLMGovernanceOverview(c *gin.Context) {
+	overview, err := h.service.GetLLMGovernanceOverview()
+	if err != nil {
+		utils.HandleError(c, err)
+		return
+	}
+
+	utils.Success(c, http.StatusOK, "LLM governance overview retrieved successfully", overview)
+}

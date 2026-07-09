@@ -9,6 +9,7 @@ import (
 
 	"clawreef/internal/models"
 	"clawreef/internal/repository"
+	"clawreef/internal/utils"
 )
 
 // AuditQuery contains query options for AI audit list views.
@@ -160,11 +161,57 @@ type CostRecordView struct {
 	RecordedAt       time.Time `json:"recorded_at"`
 }
 
+// instanceSessionUsageItem is one session row used for governance fallback-rate calculation.
+type instanceSessionUsageItem struct {
+	SessionID        string
+	SessionKey       string
+	Title            *string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	EstimatedCost    float64
+	Currency         string
+	InvocationCount  int
+	FirstSeenAt      time.Time
+	LastSeenAt       time.Time
+}
+
+// InstanceLLMGovernanceStatus summarizes LLM governance health for one instance.
+type InstanceLLMGovernanceStatus struct {
+	ConfigStatus           string  `json:"config_status"`
+	SessionFallbackRate    float64 `json:"session_fallback_rate"`
+	RecentEgressBlockCount int     `json:"recent_egress_block_count"`
+	IsCompliant            bool    `json:"is_compliant"`
+}
+
+// LLMGovernanceOverviewItem summarizes governance for one managed runtime instance.
+type LLMGovernanceOverviewItem struct {
+	InstanceID             int     `json:"instance_id"`
+	InstanceName           string  `json:"instance_name"`
+	InstanceType           string  `json:"instance_type"`
+	UserID                 int     `json:"user_id"`
+	ConfigStatus           string  `json:"config_status"`
+	SessionFallbackRate    float64 `json:"session_fallback_rate"`
+	RecentEgressBlockCount int     `json:"recent_egress_block_count"`
+	IsCompliant            bool    `json:"is_compliant"`
+}
+
+// LLMGovernanceOverview aggregates governance signals across managed runtime instances.
+type LLMGovernanceOverview struct {
+	TotalManagedInstances int                         `json:"total_managed_instances"`
+	NonCompliantCount     int                         `json:"non_compliant_count"`
+	ExternalConfigCount   int                         `json:"external_config_count"`
+	HighFallbackCount     int                         `json:"high_fallback_count"`
+	Items                 []LLMGovernanceOverviewItem `json:"items"`
+}
+
 // AIObservabilityService provides read APIs for audit and cost reporting.
 type AIObservabilityService interface {
 	ListAuditItems(query AuditQuery) (*AuditListResult, error)
 	GetTraceDetail(traceID string) (*AuditTraceDetail, error)
 	GetCostOverview(query CostQuery) (*CostOverview, error)
+	GetInstanceLLMGovernanceStatus(instanceID int, runtimeSystemInfo map[string]interface{}) (*InstanceLLMGovernanceStatus, error)
+	GetLLMGovernanceOverview() (*LLMGovernanceOverview, error)
 }
 
 type aiObservabilityService struct {
@@ -173,9 +220,11 @@ type aiObservabilityService struct {
 	costRepo        repository.CostRecordRepository
 	riskHitRepo     repository.RiskHitRepository
 	chatMessageRepo repository.ChatMessageRepository
+	chatSessionRepo repository.ChatSessionRepository
 	llmModelRepo    repository.LLMModelRepository
-	instanceRepo    repository.InstanceRepository
-	userRepo        repository.UserRepository
+	instanceRepo        repository.InstanceRepository
+	userRepo            repository.UserRepository
+	runtimeStatusRepo   repository.InstanceRuntimeStatusRepository
 }
 
 // NewAIObservabilityService creates a new observability reporting service.
@@ -185,19 +234,23 @@ func NewAIObservabilityService(
 	costRepo repository.CostRecordRepository,
 	riskHitRepo repository.RiskHitRepository,
 	chatMessageRepo repository.ChatMessageRepository,
+	chatSessionRepo repository.ChatSessionRepository,
 	llmModelRepo repository.LLMModelRepository,
 	instanceRepo repository.InstanceRepository,
 	userRepo repository.UserRepository,
+	runtimeStatusRepo repository.InstanceRuntimeStatusRepository,
 ) AIObservabilityService {
 	return &aiObservabilityService{
-		invocationRepo:  invocationRepo,
-		auditRepo:       auditRepo,
-		costRepo:        costRepo,
-		riskHitRepo:     riskHitRepo,
-		chatMessageRepo: chatMessageRepo,
-		llmModelRepo:    llmModelRepo,
-		instanceRepo:    instanceRepo,
-		userRepo:        userRepo,
+		invocationRepo:    invocationRepo,
+		auditRepo:         auditRepo,
+		costRepo:          costRepo,
+		riskHitRepo:       riskHitRepo,
+		chatMessageRepo:   chatMessageRepo,
+		chatSessionRepo:   chatSessionRepo,
+		llmModelRepo:      llmModelRepo,
+		instanceRepo:      instanceRepo,
+		userRepo:          userRepo,
+		runtimeStatusRepo: runtimeStatusRepo,
 	}
 }
 
@@ -1846,4 +1899,221 @@ func valueOrCostTotalTokens(cost *models.CostRecord) int {
 
 func pointerToInt(value int) *int {
 	return &value
+}
+
+func (s *aiObservabilityService) GetInstanceLLMGovernanceStatus(instanceID int, runtimeSystemInfo map[string]interface{}) (*InstanceLLMGovernanceStatus, error) {
+	items, err := s.mergeInstanceSessionUsageItems(instanceID, "")
+	if err != nil {
+		return nil, err
+	}
+
+	fallbackCount := 0
+	for _, item := range items {
+		if utils.IsTraceFallbackSessionID(item.SessionID) {
+			fallbackCount++
+		}
+	}
+
+	fallbackRate := 0.0
+	if len(items) > 0 {
+		fallbackRate = float64(fallbackCount) / float64(len(items))
+	}
+
+	configStatus := classifyLLMConfigStatusFromSystemInfo(runtimeSystemInfo)
+	since := time.Now().UTC().Add(-24 * time.Hour)
+	egressBlockCount := 0
+	if s.auditRepo != nil {
+		if count, err := s.auditRepo.CountRecentByInstanceAndEventType(instanceID, "egress.llm.blocked", since); err == nil {
+			egressBlockCount = count
+		}
+	}
+
+	isCompliant := fallbackRate == 0 && configStatus != "external"
+	if configStatus == "gateway" {
+		isCompliant = fallbackRate == 0
+	}
+
+	status := &InstanceLLMGovernanceStatus{
+		ConfigStatus:           configStatus,
+		SessionFallbackRate:    fallbackRate,
+		RecentEgressBlockCount: egressBlockCount,
+		IsCompliant:            isCompliant,
+	}
+	return status, nil
+}
+
+func (s *aiObservabilityService) GetLLMGovernanceOverview() (*LLMGovernanceOverview, error) {
+	if s.instanceRepo == nil {
+		return &LLMGovernanceOverview{Items: []LLMGovernanceOverviewItem{}}, nil
+	}
+
+	instances, err := s.instanceRepo.GetAllRunning()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list running instances: %w", err)
+	}
+
+	overview := &LLMGovernanceOverview{
+		Items: make([]LLMGovernanceOverviewItem, 0),
+	}
+	for _, instance := range instances {
+		if !supportsManagedRuntimeIntegration(instance.Type) {
+			continue
+		}
+		systemInfo := decodeRuntimeSystemInfo(s.runtimeStatusRepo, instance.ID)
+		status, err := s.GetInstanceLLMGovernanceStatus(instance.ID, systemInfo)
+		if err != nil {
+			return nil, err
+		}
+		if status == nil {
+			continue
+		}
+
+		item := LLMGovernanceOverviewItem{
+			InstanceID:             instance.ID,
+			InstanceName:           instance.Name,
+			InstanceType:           instance.Type,
+			UserID:                 instance.UserID,
+			ConfigStatus:           status.ConfigStatus,
+			SessionFallbackRate:    status.SessionFallbackRate,
+			RecentEgressBlockCount: status.RecentEgressBlockCount,
+			IsCompliant:            status.IsCompliant,
+		}
+		overview.TotalManagedInstances++
+		overview.Items = append(overview.Items, item)
+		if !status.IsCompliant {
+			overview.NonCompliantCount++
+		}
+		if status.ConfigStatus == "external" {
+			overview.ExternalConfigCount++
+		}
+		if status.SessionFallbackRate > 0 {
+			overview.HighFallbackCount++
+		}
+	}
+
+	return overview, nil
+}
+
+func decodeRuntimeSystemInfo(runtimeRepo repository.InstanceRuntimeStatusRepository, instanceID int) map[string]interface{} {
+	if runtimeRepo == nil {
+		return nil
+	}
+	status, err := runtimeRepo.GetByInstanceID(instanceID)
+	if err != nil || status == nil || status.SystemInfoJSON == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(*status.SystemInfoJSON)
+	if raw == "" {
+		return nil
+	}
+	systemInfo := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(raw), &systemInfo); err != nil {
+		return nil
+	}
+	return systemInfo
+}
+
+func (s *aiObservabilityService) mergeInstanceSessionUsageItems(instanceID int, search string) ([]instanceSessionUsageItem, error) {
+	tokenAggs, err := s.invocationRepo.AggregateByInstanceSession(instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to aggregate session tokens: %w", err)
+	}
+	costAggs, err := s.costRepo.AggregateCostByInstanceSession(instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to aggregate session costs: %w", err)
+	}
+
+	sessionMeta := map[string]models.ChatSession{}
+	if s.chatSessionRepo != nil {
+		sessions, listErr := s.chatSessionRepo.ListByInstanceID(instanceID)
+		if listErr != nil {
+			return nil, fmt.Errorf("failed to list chat sessions: %w", listErr)
+		}
+		for _, session := range sessions {
+			sessionMeta[session.SessionID] = session
+		}
+	}
+
+	costBySession := map[string]repository.InstanceSessionCostAggregate{}
+	for _, cost := range costAggs {
+		costBySession[cost.SessionID] = cost
+	}
+
+	items := make([]instanceSessionUsageItem, 0, len(tokenAggs))
+	for _, token := range tokenAggs {
+		item := instanceSessionUsageItem{
+			SessionID:        token.SessionID,
+			SessionKey:       utils.FormatOpenClawSessionKey(token.SessionID),
+			PromptTokens:     token.PromptTokens,
+			CompletionTokens: token.CompletionTokens,
+			TotalTokens:      token.TotalTokens,
+			InvocationCount:  token.InvocationCount,
+			FirstSeenAt:      token.FirstSeenAt,
+			LastSeenAt:       token.LastSeenAt,
+			Currency:         "USD",
+		}
+		if cost, ok := costBySession[token.SessionID]; ok {
+			item.EstimatedCost = cost.EstimatedCost
+			if strings.TrimSpace(cost.Currency) != "" {
+				item.Currency = cost.Currency
+			}
+		}
+		if session, ok := sessionMeta[token.SessionID]; ok && session.Title != nil {
+			item.Title = session.Title
+		}
+		items = append(items, item)
+	}
+
+	search = strings.ToLower(strings.TrimSpace(search))
+	if search != "" {
+		filtered := make([]instanceSessionUsageItem, 0, len(items))
+		for _, item := range items {
+			haystacks := []string{
+				strings.ToLower(item.SessionID),
+				strings.ToLower(item.SessionKey),
+			}
+			if item.Title != nil {
+				haystacks = append(haystacks, strings.ToLower(*item.Title))
+			}
+			matched := false
+			for _, candidate := range haystacks {
+				if strings.Contains(candidate, search) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].LastSeenAt.After(items[j].LastSeenAt)
+	})
+	return items, nil
+}
+
+func classifyLLMConfigStatusFromSystemInfo(systemInfo map[string]interface{}) string {
+	if len(systemInfo) == 0 {
+		return "unknown"
+	}
+	if raw, ok := systemInfo["llm_config_status"]; ok {
+		if value, ok := raw.(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if raw, ok := systemInfo["llm_provider_base_url"]; ok {
+		if value, ok := raw.(string); ok {
+			lower := strings.ToLower(strings.TrimSpace(value))
+			switch {
+			case strings.Contains(lower, "gateway/llm"), strings.Contains(lower, "clawmanager"):
+				return "gateway"
+			case strings.Contains(lower, "openai.com"), strings.Contains(lower, "anthropic.com"):
+				return "external"
+			}
+		}
+	}
+	return "unknown"
 }

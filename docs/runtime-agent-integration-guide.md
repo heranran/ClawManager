@@ -93,6 +93,43 @@ Agent 启动时如果 `CLAWMANAGER_AGENT_ENABLED` 不是 `true`，应进入空�
 
 Runtime 内的应用和 agent 如果需要调用模型，优先使用这些变量，不要让用户在镜像内手工写入 provider key。
 
+### LLM Session 归因
+
+托管 runtime 的每次 LLM 请求应携带稳定 session 标识，供平台按会话统计 token：
+
+| 项 | 要求 |
+| --- | --- |
+| Header | `x-openclaw-session-key: {sessionKey}` |
+| 示例 | `main` 会归一化为 `agent:openclaw:main` |
+| 备选 | 请求体 `session_id` 或 OpenAI `user` 字段 |
+| 禁止 | 长期依赖 Gateway 自动生成的 `sess_{traceID}` |
+
+Agent state report 可选上报 LLM 配置指纹，便于平台检测配置漂移：
+
+```json
+{
+  "runtime": {
+    "llm_config_status": "gateway",
+    "llm_provider_base_url": "http://clawmanager-gateway.../api/v1/gateway/llm",
+    "llm_config_fingerprint": "sha256..."
+  }
+}
+```
+
+### Egress 代理与实例归因
+
+托管 runtime 实例会注入 egress 代理环境变量，并将实例 ID 写入 `CLAWMANAGER_EGRESS_INSTANCE_ID`。当 egress 拦截直连 LLM 提供商域名时，平台会把该事件记为 `egress.llm.blocked` 审计。
+
+| 变量 / Header | 说明 |
+| --- | --- |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 指向 ClawManager egress proxy |
+| `CLAWMANAGER_EGRESS_INSTANCE_ID` | 当前实例 ID，供代理客户端上报 |
+| `X-ClawManager-Instance-Id` | egress 请求应携带的实例 ID header（与 `X-ClawManager-Egress-Instance-Id` 等价） |
+
+建议：任何从实例内主动发起的 egress CONNECT/HTTP 代理请求（包括自定义脚本、sidecar、调试工具）在可行时读取 `CLAWMANAGER_EGRESS_INSTANCE_ID` 并设置 `X-ClawManager-Instance-Id`，以便平台将 bypass 尝试关联到具体实例。
+
+可选网络加固：在 ClawManager 后端设置 `CLAWMANAGER_INSTANCE_NETWORK_LOCK=true` 后，新建的 **Pro（独立 Pod）** OpenClaw/Hermes 实例会自动创建 egress NetworkPolicy。**Lite（gateway 池）** 实例共享 runtime Pod，不适用按实例 NetworkPolicy。参考 `deployments/k8s/single-node/instance-egress-networkpolicy.yaml`。
+
 ## Agent 生命周期
 
 推荐主循环：
@@ -342,7 +379,7 @@ Authorization: Bearer {session_token}
 | `collect_system_info` | 立即采样，发送 state report，并在 finish result 中带上同一份摘要 |
 | `health_check` | 检查主进程、桌面入口、agent、metrics collector，并发送 state report |
 | `sync_skill_inventory` | 扫描 skill 目录并上报完整 inventory |
-| `refresh_skill_inventory` | 重新扫描 skill 目录并上报完整 inventory |
+| `refresh_skill_inventory` | **已废弃**。请使用 `sync_skill_inventory` |
 | `collect_skill_package` | 打包指定 skill 并上传 |
 | `install_skill` | 下载并安装平台指定 skill version |
 | `update_skill` | 更新已安装 skill |

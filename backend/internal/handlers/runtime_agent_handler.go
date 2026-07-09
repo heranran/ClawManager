@@ -23,10 +23,21 @@ type runtimeEventPublisher interface {
 }
 
 type RuntimeAgentHandler struct {
-	cfg         config.RuntimePoolConfig
-	podRepo     repository.RuntimePodRepository
-	bindingRepo repository.InstanceRuntimeBindingRepository
-	events      runtimeEventPublisher
+	cfg          config.RuntimePoolConfig
+	podRepo      repository.RuntimePodRepository
+	bindingRepo  repository.InstanceRuntimeBindingRepository
+	events       runtimeEventPublisher
+	skillService services.SkillService
+}
+
+func NewRuntimeAgentHandler(cfg config.RuntimePoolConfig, podRepo repository.RuntimePodRepository, bindingRepo repository.InstanceRuntimeBindingRepository, events runtimeEventPublisher, skillService services.SkillService) *RuntimeAgentHandler {
+	return &RuntimeAgentHandler{
+		cfg:          cfg,
+		podRepo:      podRepo,
+		bindingRepo:  bindingRepo,
+		events:       events,
+		skillService: skillService,
+	}
 }
 
 type runtimeAgentPodIdentity struct {
@@ -86,15 +97,6 @@ type runtimeAgentGatewayReport struct {
 	Generation   int        `json:"generation" binding:"required"`
 	ErrorMessage *string    `json:"error_message,omitempty"`
 	HealthAt     *time.Time `json:"health_at,omitempty"`
-}
-
-func NewRuntimeAgentHandler(cfg config.RuntimePoolConfig, podRepo repository.RuntimePodRepository, bindingRepo repository.InstanceRuntimeBindingRepository, events runtimeEventPublisher) *RuntimeAgentHandler {
-	return &RuntimeAgentHandler{
-		cfg:         cfg,
-		podRepo:     podRepo,
-		bindingRepo: bindingRepo,
-		events:      events,
-	}
 }
 
 func (h *RuntimeAgentHandler) Register(c *gin.Context) {
@@ -308,6 +310,12 @@ func (h *RuntimeAgentHandler) ReportSkills(c *gin.Context) {
 	if err := c.ShouldBindJSON(&payload); err != nil {
 		utils.ValidationError(c, err)
 		return
+	}
+	if h.skillService != nil {
+		if err := h.skillService.SyncRuntimeAgentSkillsReport(payload); err != nil {
+			utils.HandleError(c, err)
+			return
+		}
 	}
 	h.publish(c.Request.Context(), "runtime_agent_skills_reported", payload)
 	utils.Success(c, http.StatusOK, "Runtime agent skills report accepted", nil)

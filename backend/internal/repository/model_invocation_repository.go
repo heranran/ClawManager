@@ -10,6 +10,17 @@ import (
 	"github.com/upper/db/v4"
 )
 
+// InstanceSessionTokenAggregate summarizes token usage for one session on an instance.
+type InstanceSessionTokenAggregate struct {
+	SessionID        string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	InvocationCount  int
+	FirstSeenAt      time.Time
+	LastSeenAt       time.Time
+}
+
 // ModelInvocationRepository defines repository operations for governed model calls.
 type ModelInvocationRepository interface {
 	Create(invocation *models.ModelInvocation) error
@@ -18,6 +29,7 @@ type ModelInvocationRepository interface {
 	ListBySessionID(sessionID string, limit int) ([]models.ModelInvocation, error)
 	ListByUserID(userID, limit int) ([]models.ModelInvocation, error)
 	ListRecent(limit int) ([]models.ModelInvocation, error)
+	AggregateByInstanceSession(instanceID int) ([]InstanceSessionTokenAggregate, error)
 }
 
 type modelInvocationRepository struct {
@@ -143,6 +155,49 @@ func (r *modelInvocationRepository) ListRecent(limit int) ([]models.ModelInvocat
 	}
 	if err := r.sess.Collection("model_invocations").Find().OrderBy("-created_at").Limit(limit).All(&items); err != nil {
 		return nil, fmt.Errorf("failed to list recent model invocations: %w", err)
+	}
+	return items, nil
+}
+
+func (r *modelInvocationRepository) AggregateByInstanceSession(instanceID int) ([]InstanceSessionTokenAggregate, error) {
+	rows, err := r.sess.SQL().Query(`
+SELECT session_id,
+       COALESCE(SUM(prompt_tokens), 0),
+       COALESCE(SUM(completion_tokens), 0),
+       COALESCE(SUM(total_tokens), 0),
+       COUNT(*),
+       MIN(created_at),
+       MAX(created_at)
+FROM model_invocations
+WHERE instance_id = ?
+  AND session_id IS NOT NULL
+  AND session_id != ''
+  AND status != ?
+GROUP BY session_id
+`, instanceID, models.ModelInvocationStatusBlocked)
+	if err != nil {
+		return nil, fmt.Errorf("failed to aggregate model invocations by instance session: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]InstanceSessionTokenAggregate, 0)
+	for rows.Next() {
+		var item InstanceSessionTokenAggregate
+		if err := rows.Scan(
+			&item.SessionID,
+			&item.PromptTokens,
+			&item.CompletionTokens,
+			&item.TotalTokens,
+			&item.InvocationCount,
+			&item.FirstSeenAt,
+			&item.LastSeenAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan session token aggregate: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate session token aggregates: %w", err)
 	}
 	return items, nil
 }

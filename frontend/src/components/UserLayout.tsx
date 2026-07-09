@@ -5,6 +5,7 @@ import {
   Home,
   LogOut,
   Monitor,
+  Package,
   Settings,
   SlidersHorizontal,
   Users,
@@ -41,6 +42,7 @@ const UserLayout: React.FC<UserLayoutProps> = ({ children, title, titleAccessory
     { path: '/instances', label: t('nav.myInstances'), icon: Monitor },
     { path: '/teams', label: 'Teams', icon: Users },
     { path: '/openclaw-configs', label: t('nav.openClawConfigs'), icon: SlidersHorizontal },
+    { path: '/skill-hub', label: t('nav.skillHub'), icon: Package },
     { path: '/settings', label: t('nav.settings'), icon: Settings },
   ];
 

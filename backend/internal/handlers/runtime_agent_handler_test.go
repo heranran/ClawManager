@@ -18,7 +18,7 @@ import (
 func TestRuntimeAgentHandlerRejectsInvalidToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	podRepo := &runtimeAgentHandlerPodRepo{}
-	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, podRepo, &runtimeAgentHandlerBindingRepo{}, &runtimeAgentHandlerEvents{})
+	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, podRepo, &runtimeAgentHandlerBindingRepo{}, &runtimeAgentHandlerEvents{}, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/runtime-agent/metrics/report", handler.ReportMetrics)
@@ -43,7 +43,7 @@ func TestRuntimeAgentHandlerRegisterUsesConfiguredCapacity(t *testing.T) {
 	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{
 		AgentReportToken:  "secret",
 		MaxGatewaysPerPod: 33,
-	}, podRepo, &runtimeAgentHandlerBindingRepo{}, events)
+	}, podRepo, &runtimeAgentHandlerBindingRepo{}, events, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/runtime-agent/register", handler.Register)
@@ -94,7 +94,7 @@ func TestRuntimeAgentHandlerHeartbeatUsesConfiguredCapacity(t *testing.T) {
 	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{
 		AgentReportToken:  "secret",
 		MaxGatewaysPerPod: 44,
-	}, podRepo, &runtimeAgentHandlerBindingRepo{}, events)
+	}, podRepo, &runtimeAgentHandlerBindingRepo{}, events, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/runtime-agent/heartbeat", handler.Heartbeat)
@@ -133,7 +133,7 @@ func TestRuntimeAgentHandlerMetricsReportUpdatesPodAndPublishesEvent(t *testing.
 	gin.SetMode(gin.TestMode)
 	podRepo := &runtimeAgentHandlerPodRepo{}
 	events := &runtimeAgentHandlerEvents{}
-	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, podRepo, &runtimeAgentHandlerBindingRepo{}, events)
+	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, podRepo, &runtimeAgentHandlerBindingRepo{}, events, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/runtime-agent/metrics/report", handler.ReportMetrics)
@@ -186,7 +186,7 @@ func TestRuntimeAgentHandlerGatewayReportOnlyUpdatesCurrentPodBinding(t *testing
 			12: {InstanceID: 12, RuntimePodID: 9, Generation: 3},
 		},
 	}
-	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, &runtimeAgentHandlerPodRepo{}, bindingRepo, &runtimeAgentHandlerEvents{})
+	handler := NewRuntimeAgentHandler(config.RuntimePoolConfig{AgentReportToken: "secret"}, &runtimeAgentHandlerPodRepo{}, bindingRepo, &runtimeAgentHandlerEvents{}, nil)
 
 	router := gin.New()
 	router.POST("/api/v1/runtime-agent/gateways/report", handler.ReportGateways)

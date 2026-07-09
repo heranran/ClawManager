@@ -104,7 +104,7 @@ func main() {
 		log.Fatalf("Failed to initialize object storage: %v", err)
 	}
 	skillScannerClient := services.NewSkillScannerClient(cfg.SkillScanner)
-	aiObservabilityService := services.NewAIObservabilityService(modelInvocationRepo, auditEventRepo, costRecordRepo, riskHitRepo, chatMessageRepo, llmModelRepo, instanceRepo, userRepo)
+	aiObservabilityService := services.NewAIObservabilityService(modelInvocationRepo, auditEventRepo, costRecordRepo, riskHitRepo, chatMessageRepo, chatSessionRepo, llmModelRepo, instanceRepo, userRepo, instanceRuntimeStatusRepo)
 	clusterResourceService := services.NewClusterResourceService(instanceRepo)
 	services.SetRuntimeImageSettingsProvider(systemImageSettingService)
 	services.SetOpenClawTransferRuntimeRepositories(instanceRepo, bindingRepo, runtimePodRepo)
@@ -140,7 +140,19 @@ func main() {
 	runtimeEvents := services.NewRuntimeEventService(platformRedis)
 	workspaceFileService := services.NewWorkspaceFileService(workspaceFileAuditRepo)
 	runtimeWorkspaceFileService := services.NewRuntimeWorkspaceFileService(workspaceFileAuditRepo)
-	skillService := services.NewSkillService(skillRepo, instanceRepo, instanceCommandService, objectStorageService, skillScannerClient)
+	skillService := services.NewSkillService(skillRepo, instanceRepo, userRepo, instanceCommandService, instanceCommandRepo, objectStorageService, skillScannerClient)
+	materializeJobRepo := repository.NewSkillPackageMaterializeJobRepository(database)
+	materializeService := services.NewSkillPackageMaterializeService(materializeJobRepo, skillRepo, services.SkillServiceAsMaterializer(skillService))
+	services.ConfigureSkillPackageMaterialize(skillService, materializeService)
+	materializeWorker := services.NewSkillPackageMaterializeWorker(
+		materializeService,
+		time.Duration(cfg.SkillMaterialize.TickMS)*time.Millisecond,
+		cfg.SkillMaterialize.BatchSize,
+		cfg.SkillMaterialize.Concurrency,
+		cfg.SkillMaterialize.PerInstanceConcurrency,
+		cfg.SkillMaterialize.Enabled,
+	)
+	services.ConfigureSkillRuntimeSync(skillService, bindingRepo, runtimePodRepo, runtimeAgentClient)
 	securityScanService := services.NewSecurityScanService(securityScanRepo, skillRepo, objectStorageService, skillScannerClient)
 	externalAccessService := services.NewInstanceExternalAccessService(instanceExternalAccessRepo)
 	aiGatewayService := aigateway.NewService(llmModelRepo, modelInvocationService, auditEventService, costRecordService, riskDetectionService, riskHitService, chatSessionService, chatMessageService)
@@ -157,6 +169,7 @@ func main() {
 		openClawConfigService,
 		skillService,
 		externalAccessService,
+		aiObservabilityService,
 		services.WithInstanceProxyRuntimeRepositories(instanceRepo, runtimePodRepo, bindingRepo),
 	)
 	systemSettingsHandler := handlers.NewSystemSettingsHandler(systemImageSettingService)
@@ -165,15 +178,16 @@ func main() {
 	aiObservabilityHandler := handlers.NewAIObservabilityHandler(aiObservabilityService)
 	riskRuleHandler := handlers.NewRiskRuleHandler(riskRuleService)
 	clusterResourceHandler := handlers.NewClusterResourceHandler(clusterResourceService)
-	egressProxyHandler := handlers.NewEgressProxyHandler()
+	egressProxyHandler := handlers.NewEgressProxyHandler(auditEventService)
 	openClawConfigHandler := handlers.NewOpenClawConfigHandler(openClawConfigService)
 	skillHandler := handlers.NewSkillHandler(skillService, instanceService)
+	skillHubHandler := handlers.NewSkillHubHandler(skillService, instanceService)
 	securityHandler := handlers.NewSecurityHandler(securityScanService)
 	agentHandler := handlers.NewAgentHandler(instanceAgentService, instanceCommandService, instanceRuntimeStatusService, instanceConfigRevisionService, skillService)
 	teamHandler := handlers.NewTeamHandler(teamService)
 	workspaceFileHandler := handlers.NewWorkspaceFileHandler(instanceService, workspaceFileService, runtimeWorkspaceFileService)
 	workspaceFileHandler.SetSkillRepository(skillRepo)
-	runtimeAgentHandler := handlers.NewRuntimeAgentHandler(cfg.Runtime, runtimePodRepo, bindingRepo, runtimeEvents)
+	runtimeAgentHandler := handlers.NewRuntimeAgentHandler(cfg.Runtime, runtimePodRepo, bindingRepo, runtimeEvents, skillService)
 
 	// Initialize WebSocket hub and handler
 	wsHub := services.GetHub()
@@ -238,6 +252,7 @@ func main() {
 	startBackground := func(ctx context.Context) {
 		log.Printf("Starting leader-only background loops (identity=%s)", cfg.LeaderElection.Identity)
 		syncService.Start()
+		materializeWorker.Start()
 		teamService.StartBackground(ctx)
 		if runtimeScheduler != nil {
 			runtimeSchedulerMu.Lock()
@@ -252,6 +267,7 @@ func main() {
 	}
 	stopBackground := func() {
 		log.Printf("Stopping leader-only background loops (identity=%s)", cfg.LeaderElection.Identity)
+		materializeWorker.Stop()
 		runtimeSchedulerMu.Lock()
 		if runtimeSchedulerCancel != nil {
 			runtimeSchedulerCancel()
@@ -379,6 +395,10 @@ func main() {
 			instances.GET("/:id/skills", skillHandler.ListInstanceSkills)
 			instances.GET("/:id/skills/available", skillHandler.ListAvailableInstanceSkills)
 			instances.POST("/:id/skills", skillHandler.AttachSkillToInstance)
+			instances.POST("/:id/skills/sync", instanceHandler.RefreshInstanceSkills)
+			instances.POST("/:id/skills/:skillId/import-to-library", instanceHandler.ImportInstanceSkillToLibrary)
+			instances.POST("/:id/skills/:skillId/retry-package-collect", instanceHandler.RetrySkillPackageCollect)
+			instances.POST("/:id/skills/:skillId/publish-to-hub", instanceHandler.PublishInstanceSkillToHub)
 			instances.DELETE("/:id/skills/:skillId", skillHandler.RemoveSkillFromInstance)
 		}
 
@@ -464,6 +484,38 @@ func main() {
 			skills.GET("/:id/scan-results", skillHandler.ListScanResults)
 		}
 
+		skillHub := api.Group("/skill-hub")
+		skillHub.Use(middleware.Auth())
+		skillHub.Use(middleware.SetUserInfo(userRepo))
+		{
+			skillHub.GET("/catalog", skillHubHandler.ListCatalog)
+			skillHub.GET("/tags", skillHubHandler.ListTags)
+			skillHub.GET("/mine", skillHubHandler.ListMine)
+			skillHub.GET("/attachable", skillHubHandler.ListAttachable)
+			skillHub.POST("/skills/import/preview", skillHubHandler.PreviewImportSkills)
+			skillHub.POST("/skills/import", skillHubHandler.ImportSkills)
+			skillHub.GET("/skills/:id", skillHubHandler.GetSkill)
+			skillHub.POST("/skills/:id/publish", skillHubHandler.PublishSkill)
+			skillHub.POST("/skills/:id/unpublish", skillHubHandler.UnpublishSkill)
+			skillHub.PUT("/skills/:id/tags", skillHubHandler.UpdateTags)
+			skillHub.DELETE("/skills/:id", skillHubHandler.DeleteSkill)
+			skillHub.GET("/skills/:id/download", skillHubHandler.DownloadSkill)
+			skillHub.POST("/skills/:id/install", skillHubHandler.InstallSkill)
+		}
+
+		adminSkillHub := api.Group("/admin/skill-hub")
+		adminSkillHub.Use(middleware.Auth())
+		adminSkillHub.Use(middleware.SetUserInfo(userRepo))
+		adminSkillHub.Use(middleware.NewAdminAuth(userRepo))
+		{
+			adminSkillHub.GET("/skills", skillHubHandler.ListAdminSkills)
+			adminSkillHub.POST("/skills/:id/publish", skillHubHandler.PublishSkill)
+			adminSkillHub.POST("/skills/:id/unpublish", skillHubHandler.UnpublishSkill)
+			adminSkillHub.PUT("/skills/:id/tags", skillHubHandler.UpdateTags)
+			adminSkillHub.DELETE("/skills/:id", skillHubHandler.DeleteSkill)
+			adminSkillHub.POST("/skills/:id/install", skillHubHandler.InstallSkill)
+		}
+
 		systemSettings := api.Group("/system-settings")
 		systemSettings.Use(middleware.Auth())
 		systemSettings.Use(middleware.SetUserInfo(userRepo))
@@ -507,6 +559,14 @@ func main() {
 		adminCosts.Use(middleware.NewAdminAuth(userRepo))
 		{
 			adminCosts.GET("", aiObservabilityHandler.GetCostOverview)
+		}
+
+		adminLLMGovernance := api.Group("/admin/llm-governance")
+		adminLLMGovernance.Use(middleware.Auth())
+		adminLLMGovernance.Use(middleware.SetUserInfo(userRepo))
+		adminLLMGovernance.Use(middleware.NewAdminAuth(userRepo))
+		{
+			adminLLMGovernance.GET("/overview", aiObservabilityHandler.GetLLMGovernanceOverview)
 		}
 
 		adminRiskRules := api.Group("/admin/risk-rules")
