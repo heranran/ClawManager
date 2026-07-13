@@ -178,7 +178,7 @@ func main() {
 	aiObservabilityHandler := handlers.NewAIObservabilityHandler(aiObservabilityService)
 	riskRuleHandler := handlers.NewRiskRuleHandler(riskRuleService)
 	clusterResourceHandler := handlers.NewClusterResourceHandler(clusterResourceService)
-	egressProxyHandler := handlers.NewEgressProxyHandler(auditEventService)
+	egressProxyHandler := handlers.NewEgressProxyHandler()
 	openClawConfigHandler := handlers.NewOpenClawConfigHandler(openClawConfigService)
 	skillHandler := handlers.NewSkillHandler(skillService, instanceService)
 	skillHubHandler := handlers.NewSkillHubHandler(skillService, instanceService)
